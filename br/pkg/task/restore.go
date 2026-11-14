@@ -367,6 +367,10 @@ type RestoreConfig struct {
 	// field may be assigned after ParseFromFlags (or DefaultRestoreConfig), so
 	// a stale cache must never be returned when the rules changed.
 	nameRouterRules []string `json:"-" toml:"-"`
+
+	// replicasAfterRestore is the replica count the restored data will have once
+	// PD has added the others, set by --single-replica for the disk space check.
+	replicasAfterRestore uint64 `json:"-" toml:"-"`
 }
 
 func (cfg *RestoreConfig) LocalEncryptionEnabled() bool {
@@ -434,7 +438,8 @@ func DefineRestoreFlags(flags *pflag.FlagSet) {
 	flags.Bool(flagLoadStats, true, "Run load stats or update stats_meta to trigger auto-analyze at end of snapshot restore task")
 	flags.Bool(flagFastLoadSysTables, true, "load system tables (including statistics) by renaming the temporary system tables")
 	flags.Bool(flagSingleReplica, false, "restore with one replica of each region, then put the replica count back "+
-		"so PD adds the other replicas in the background. The target cluster must have no user tables. "+
+		"so PD adds the other replicas in the background. The target cluster must have no user tables, so it cannot "+
+		"resume an interrupted restore from its checkpoint: run that one without this flag. "+
 		"Until PD finishes the cluster has no redundancy: losing a TiKV loses the regions it holds.")
 	// Do not expose this flag
 	_ = flags.MarkHidden(flagNoSchema)
@@ -1175,6 +1180,7 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 		defer func() {
 			restoreErr = singleReplica.leave(c, restoreErr)
 		}()
+		cfg.replicasAfterRestore = uint64(singleReplica.effectiveReplicas())
 	}
 	defer func() {
 		if logTaskBackend == nil || restoreErr != nil {
@@ -2243,10 +2249,15 @@ func CheckStoreSpace(necessary uint64, store *http.StoreInfo) error {
 	return nil
 }
 
-func checkDiskSpace(ctx context.Context, mgr *conn.Mgr, tables []*metautil.Table, archiveSize uint64) error {
-	maxReplica, err := getMaxReplica(ctx, mgr)
-	if err != nil {
-		return errors.Trace(err)
+// checkDiskSpace checks the stores can hold the restored data. replicas is the
+// replica count to check for, or 0 for the one PD keeps now.
+func checkDiskSpace(ctx context.Context, mgr *conn.Mgr, tables []*metautil.Table, archiveSize uint64, replicas uint64) error {
+	maxReplica := replicas
+	if maxReplica == 0 {
+		var err error
+		if maxReplica, err = getMaxReplica(ctx, mgr); err != nil {
+			return errors.Trace(err)
+		}
 	}
 	stores, err := getStores(ctx, mgr)
 	if err != nil {
@@ -2986,7 +2997,7 @@ func checkOptionalClusterRequirements(
 	isPitr bool,
 	nameSources *restoreNameSources) error {
 	if cfg.CheckRequirements && !checkpointEnabledAndExists {
-		if err := checkDiskSpace(ctx, mgr, sourceTables, archiveSize); err != nil {
+		if err := checkDiskSpace(ctx, mgr, sourceTables, archiveSize, cfg.replicasAfterRestore); err != nil {
 			return errors.Trace(err)
 		}
 	}

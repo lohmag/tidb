@@ -29,6 +29,7 @@ type fakeReplicaConfig struct {
 	rulesEnabled  bool
 	ruleCount     int
 	failSet       bool
+	failRuleTo1   bool
 	replicaWrites []int
 }
 
@@ -55,6 +56,9 @@ func (f *fakeReplicaConfig) GetPlacementRule(_ context.Context, group, id string
 }
 
 func (f *fakeReplicaConfig) SetPlacementRule(_ context.Context, r *pdhttp.Rule) error {
+	if f.failRuleTo1 && r.Count == 1 {
+		return errors.New("rule rejected")
+	}
 	f.ruleCount = r.Count
 	return nil
 }
@@ -129,4 +133,29 @@ func TestSingleReplicaRestoreLeavesASingleReplicaClusterAlone(t *testing.T) {
 	require.Empty(t, f.replicaWrites)
 	require.Contains(t, out.String(), "--single-replica changed nothing")
 	require.NotContains(t, out.String(), "no redundancy")
+}
+
+func TestSingleReplicaRestoreUndoesAHalfDoneEnter(t *testing.T) {
+	f := &fakeReplicaConfig{replicas: 3, rulesEnabled: true, ruleCount: 3, failRuleTo1: true}
+	s := &singleReplicaRestore{pd: f, console: &bytes.Buffer{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := s.enter(ctx)
+	require.ErrorContains(t, err, "rule rejected")
+	require.Equal(t, []int{1, 3}, f.replicaWrites)
+	require.Equal(t, 3, f.replicas)
+	require.Equal(t, 3, f.ruleCount)
+}
+
+func TestSingleReplicaRestoreHalfDoneEnterTellsHowToFixAFailedUndo(t *testing.T) {
+	f := &fakeReplicaConfig{replicas: 3, rulesEnabled: true, ruleCount: 3, failRuleTo1: true, failSet: true}
+	out := &bytes.Buffer{}
+	s := &singleReplicaRestore{pd: f, console: out}
+
+	err := s.enter(context.Background())
+	require.ErrorContains(t, err, "rule rejected")
+	require.ErrorContains(t, err, "pd is down")
+	require.Equal(t, 1, f.replicas)
+	require.Contains(t, out.String(), "Set max-replicas to 3 in PD and the count of the default placement rule to 3 by hand.")
 }

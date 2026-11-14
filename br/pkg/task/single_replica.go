@@ -101,10 +101,21 @@ func (s *singleReplicaRestore) enter(ctx context.Context) error {
 		rule := *s.defaultRule
 		rule.Count = 1
 		if err := s.pd.SetPlacementRule(ctx, &rule); err != nil {
-			return errors.Annotate(err, "single replica: set the default placement rule to 1 peer")
+			return s.rollback(ctx, errors.Annotate(err, "single replica: set the default placement rule to 1 peer"))
 		}
 	}
 	return nil
+}
+
+// rollback puts back what enter already changed when enter fails half way.
+func (s *singleReplicaRestore) rollback(ctx context.Context, enterErr error) error {
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), singleReplicaResetTimeout)
+	defer cancel()
+	if err := s.putBack(resetCtx); err != nil {
+		s.sayResetFailed(err)
+		return multierr.Append(enterErr, err)
+	}
+	return enterErr
 }
 
 // effectiveReplicas is the count PD keeps: the default placement rule's when
@@ -142,10 +153,7 @@ func (s *singleReplicaRestore) leave(ctx context.Context, restoreErr error) erro
 	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), singleReplicaResetTimeout)
 	defer cancel()
 	if err := s.putBack(resetCtx); err != nil {
-		log.Error("single replica restore: failed to put the replica count back",
-			zap.Int("replicas", s.replicas), zap.Error(err))
-		s.say("The cluster may still keep one replica of each region. Set max-replicas to %d in PD%s by hand.",
-			s.replicas, s.ruleHint())
+		s.sayResetFailed(err)
 		return multierr.Append(restoreErr, err)
 	}
 	msg := "PD is adding the other replicas in the background. Until it finishes the cluster has no redundancy: " +
@@ -160,6 +168,13 @@ func (s *singleReplicaRestore) leave(ctx context.Context, restoreErr error) erro
 		zap.Int("replicas", s.replicas))
 	s.say("Restored with one replica of each region. The replica count is back to %d. %s", s.effectiveReplicas(), msg)
 	return nil
+}
+
+func (s *singleReplicaRestore) sayResetFailed(err error) {
+	log.Error("single replica restore: failed to put the replica count back",
+		zap.Int("replicas", s.replicas), zap.Error(err))
+	s.say("The cluster may still keep one replica of each region. Set max-replicas to %d in PD%s by hand.",
+		s.replicas, s.ruleHint())
 }
 
 func (s *singleReplicaRestore) ruleHint() string {
