@@ -279,6 +279,7 @@ type RestoreConfig struct {
 	RestoreCommonConfig
 
 	NoSchema              bool          `json:"no-schema" toml:"no-schema"`
+	SingleReplica         bool          `json:"single-replica" toml:"single-replica"`
 	Rename                []string      `json:"rename" toml:"rename"`
 	LoadStats             bool          `json:"load-stats" toml:"load-stats"`
 	FastLoadSysTables     bool          `json:"fast-load-sys-tables" toml:"fast-load-sys-tables"`
@@ -432,6 +433,9 @@ func DefineRestoreFlags(flags *pflag.FlagSet) {
 		"A schema created for a rename is retained even if the restore ends up dropping every table in it")
 	flags.Bool(flagLoadStats, true, "Run load stats or update stats_meta to trigger auto-analyze at end of snapshot restore task")
 	flags.Bool(flagFastLoadSysTables, true, "load system tables (including statistics) by renaming the temporary system tables")
+	flags.Bool(flagSingleReplica, false, "restore with one replica of each region, then put the replica count back "+
+		"so PD adds the other replicas in the background. The target cluster must have no user tables. "+
+		"Until PD finishes the cluster has no redundancy: losing a TiKV loses the regions it holds.")
 	// Do not expose this flag
 	_ = flags.MarkHidden(flagNoSchema)
 	flags.String(FlagWithPlacementPolicy, "STRICT", "correspond to tidb global/session variable with-tidb-placement-mode")
@@ -551,6 +555,10 @@ func (cfg *RestoreConfig) ParseFromFlags(flags *pflag.FlagSet, skipCommonConfig 
 		return errors.Trace(err)
 	}
 	cfg.FastLoadSysTables, err = flags.GetBool(flagFastLoadSysTables)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.SingleReplica, err = flags.GetBool(flagSingleReplica)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1159,6 +1167,15 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 	}
 	defer mgr.Close()
 	defer cfg.CloseCheckpointMetaManager()
+	if cfg.SingleReplica {
+		singleReplica, err := enterSingleReplicaRestore(c, mgr, glue.GetConsole(g).Out())
+		if err != nil {
+			return errors.Trace(err)
+		}
+		defer func() {
+			restoreErr = singleReplica.leave(c, restoreErr)
+		}()
+	}
 	defer func() {
 		if logTaskBackend == nil || restoreErr != nil {
 			return
