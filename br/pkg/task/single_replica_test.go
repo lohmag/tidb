@@ -30,6 +30,7 @@ type fakeReplicaConfig struct {
 	ruleCount     int
 	failSet       bool
 	failRuleTo1   bool
+	lostSetTo1    bool
 	replicaWrites []int
 }
 
@@ -48,6 +49,9 @@ func (f *fakeReplicaConfig) SetConfig(_ context.Context, cfg map[string]any, _ .
 	}
 	f.replicas = n
 	f.replicaWrites = append(f.replicaWrites, n)
+	if f.lostSetTo1 && n == 1 {
+		return errors.New("response lost")
+	}
 	return nil
 }
 
@@ -158,4 +162,15 @@ func TestSingleReplicaRestoreHalfDoneEnterTellsHowToFixAFailedUndo(t *testing.T)
 	require.ErrorContains(t, err, "pd is down")
 	require.Equal(t, 1, f.replicas)
 	require.Contains(t, out.String(), "Set max-replicas to 3 in PD and the count of the default placement rule to 3 by hand.")
+}
+
+func TestSingleReplicaRestoreUndoesASetWhoseResponseWasLost(t *testing.T) {
+	f := &fakeReplicaConfig{replicas: 3, rulesEnabled: true, ruleCount: 3, lostSetTo1: true}
+	s := &singleReplicaRestore{pd: f, console: &bytes.Buffer{}}
+
+	err := s.enter(context.Background())
+	require.ErrorContains(t, err, "response lost")
+	require.Equal(t, []int{1, 3}, f.replicaWrites)
+	require.Equal(t, 3, f.replicas)
+	require.Equal(t, 3, f.ruleCount)
 }

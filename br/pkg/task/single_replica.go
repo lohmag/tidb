@@ -95,7 +95,8 @@ func (s *singleReplicaRestore) enter(ctx context.Context) error {
 	log.Info("single replica restore: keeping one replica of each region during the restore",
 		zap.Int("replicas", s.replicas), zap.Bool("placement-rules", s.rulesEnabled))
 	if err := s.pd.SetConfig(ctx, map[string]any{"max-replicas": 1}); err != nil {
-		return errors.Annotate(err, "single replica: set max-replicas to 1")
+		// PD may have applied it and only the response was lost.
+		return s.rollback(ctx, errors.Annotate(err, "single replica: set max-replicas to 1"))
 	}
 	if s.rulesEnabled {
 		rule := *s.defaultRule
